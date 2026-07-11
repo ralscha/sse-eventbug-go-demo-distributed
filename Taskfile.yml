@@ -1,0 +1,50 @@
+version: '3'
+
+tasks:
+  default:
+    desc: List available tasks
+    silent: true
+    cmds: [task --list]
+
+  demo:
+    desc: Run both nodes and the frontend
+    deps: [node-a, node-b, client]
+
+  node-a:
+    desc: Start Node A on port 8080
+    cmds: [go run . -port 8080 -node "Node A"]
+
+  node-b:
+    desc: Start Node B on port 8081
+    cmds: [go run . -port 8081 -node "Node B"]
+
+  valkey:
+    desc: Start Valkey with Docker Compose
+    cmds: [docker compose up -d]
+
+  client:
+    desc: Start the Vite client on port 5173
+    dir: client
+    deps: [client-install]
+    cmds: [npm run dev -- --host]
+
+  client-install:
+    desc: Install frontend dependencies
+    dir: client
+    cmds: [npm install]
+
+  client-build:
+    desc: Build the frontend
+    dir: client
+    deps: [client-install]
+    cmds: [npm run build]
+
+  test:
+    desc: Run backend tests
+    cmds: [go test ./...]
+
+  build:
+    desc: Build backend and frontend
+    cmds:
+      - go build ./...
+      - task: client-build
