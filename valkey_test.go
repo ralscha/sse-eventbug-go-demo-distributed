@@ -5,8 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +33,23 @@ func TestRESPCommandAndArray(t *testing.T) {
 	}
 	if !reflect.DeepEqual(value, []any{"message", "channel", "hello"}) {
 		t.Fatalf("value=%#v", value)
+	}
+}
+
+func TestRESPRejectsMalformedOrOversizedValues(t *testing.T) {
+	tests := map[string]string{
+		"line ending":    "+OK\n",
+		"bulk ending":    "$3\r\nabcXX",
+		"bulk too large": "$2097153\r\n",
+		"negative array": "*-2\r\n",
+		"deep nesting":   strings.Repeat("*1\r\n", maxRESPDepth+2) + "+OK\r\n",
+	}
+	for name, input := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := readRESP(bufio.NewReader(strings.NewReader(input))); err == nil {
+				t.Fatal("malformed RESP value was accepted")
+			}
+		})
 	}
 }
 
@@ -165,5 +187,80 @@ func TestValkeyTransportPublishesAndReceivesRemoteEvents(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("remote event was not delivered")
+	}
+}
+
+func TestValkeyPublishHonorsContextDeadline(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = connection.Close() }()
+		_, _ = readRESP(bufio.NewReader(connection))
+		_, _ = io.Copy(io.Discard, connection)
+	}()
+
+	transport := newValkeyTransport(listener.Addr().String(), "events")
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	err = transport.PublishRemote(ctx, sseeventbus.NewEvent("payload"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("PublishRemote = %v, want context deadline", err)
+	}
+}
+
+type captureConnection struct{ messages chan sseeventbus.Message }
+
+func (c *captureConnection) Send(message sseeventbus.Message) error {
+	c.messages <- message
+	return nil
+}
+func (*captureConnection) Close() error { return nil }
+
+func TestSendPublishesStructuredPayload(t *testing.T) {
+	bus, err := sseeventbus.New(sseeventbus.WithSynchronousDelivery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	connection := &captureConnection{messages: make(chan sseeventbus.Message, 1)}
+	if err := bus.Register("client", connection, sseeventbus.SubscribeTo("chat")); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	newHandler(bus, "Node A").ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/send", strings.NewReader(" hello ")))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatal("cross-origin production client is not allowed")
+	}
+	message := <-connection.messages
+	var payload chatPayload
+	if err := json.Unmarshal([]byte(message.Data), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload != (chatPayload{Text: "hello", Node: "Node A"}) {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestSendRejectsEmptyMessage(t *testing.T) {
+	bus, err := sseeventbus.New(sseeventbus.WithSynchronousDelivery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	response := httptest.NewRecorder()
+	newHandler(bus, "Node A").ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/send", strings.NewReader(" \n ")))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
 	}
 }

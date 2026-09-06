@@ -1,3 +1,5 @@
 import App from './app.js';
 
-new App().start();
+const app = new App();
+app.start();
+window.addEventListener('pagehide', () => app.stop(), { once: true });

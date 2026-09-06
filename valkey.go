@@ -12,10 +12,18 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ralscha/sse-eventbus-go"
+)
+
+const (
+	valkeyIOTimeout  = 3 * time.Second
+	maxRESPBulkSize  = 2 << 20
+	maxRESPArraySize = 1024
+	maxRESPDepth     = 16
 )
 
 type wireEvent struct {
@@ -51,6 +59,9 @@ func newValkeyTransport(address, channel string) *valkeyTransport {
 func (t *valkeyTransport) SetRemoteEventConsumer(consumer func(sseeventbus.Event)) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if consumer == nil {
+		return errors.New("remote event consumer is nil")
+	}
 	if t.configured {
 		return errors.New("remote event consumer already configured")
 	}
@@ -62,6 +73,9 @@ func (t *valkeyTransport) SetRemoteEventConsumer(consumer func(sseeventbus.Event
 }
 
 func (t *valkeyTransport) PublishRemote(ctx context.Context, event sseeventbus.Event) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	data, hasData := event.Data.(string)
 	if event.Data != nil && !hasData {
 		encoded, err := json.Marshal(event.Data)
@@ -71,21 +85,53 @@ func (t *valkeyTransport) PublishRemote(ctx context.Context, event sseeventbus.E
 		data = string(encoded)
 		hasData = true
 	}
-	payload, err := json.Marshal(remoteEnvelope{OriginNodeID: t.nodeID, Event: wireEvent{ClientIDs: event.ClientIDs, ExcludeClientIDs: event.ExcludeClientIDs, Name: event.Name, Data: data, HasData: hasData, Retry: int64(event.Retry), ID: event.ID, Comment: event.Comment}})
+	payload, err := json.Marshal(remoteEnvelope{
+		OriginNodeID: t.nodeID,
+		Event: wireEvent{
+			ClientIDs: event.ClientIDs, ExcludeClientIDs: event.ExcludeClientIDs,
+			Name: event.Name, Data: data, HasData: hasData, Retry: int64(event.Retry),
+			ID: event.ID, Comment: event.Comment,
+		},
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("encode remote event: %w", err)
 	}
-	dialer := net.Dialer{Timeout: 3 * time.Second}
+	dialer := net.Dialer{Timeout: valkeyIOTimeout}
 	connection, err := dialer.DialContext(ctx, "tcp", t.address)
 	if err != nil {
 		return fmt.Errorf("connect to Valkey: %w", err)
 	}
 	defer func() { _ = connection.Close() }()
-	if err := writeCommand(connection, "PUBLISH", t.channel, string(payload)); err != nil {
-		return err
+	deadline := time.Now().Add(valkeyIOTimeout)
+	contextDeadline, hasContextDeadline := ctx.Deadline()
+	if hasContextDeadline && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
 	}
-	_, err = readRESP(bufio.NewReader(connection))
-	return err
+	if err := connection.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set Valkey deadline: %w", err)
+	}
+	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.SetDeadline(time.Now()) })
+	defer stopCancellation()
+	if err := writeCommand(connection, "PUBLISH", t.channel, string(payload)); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("publish to Valkey: %w", err)
+	}
+	response, err := readRESP(bufio.NewReader(connection))
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if hasContextDeadline && !time.Now().Before(contextDeadline) {
+			return context.DeadlineExceeded
+		}
+		return fmt.Errorf("read Valkey publish response: %w", err)
+	}
+	if _, ok := response.(int64); !ok {
+		return fmt.Errorf("unexpected Valkey publish response %T", response)
+	}
+	return nil
 }
 
 func (t *valkeyTransport) subscribe() {
@@ -106,7 +152,7 @@ func (t *valkeyTransport) subscribe() {
 }
 
 func (t *valkeyTransport) subscribeOnce() error {
-	dialer := net.Dialer{Timeout: 3 * time.Second}
+	dialer := net.Dialer{Timeout: valkeyIOTimeout}
 	connection, err := dialer.DialContext(t.ctx, "tcp", t.address)
 	if err != nil {
 		return err
@@ -131,15 +177,20 @@ func (t *valkeyTransport) subscribeOnce() error {
 			return err
 		}
 		parts, ok := value.([]any)
-		if !ok || len(parts) != 3 || asString(parts[0]) != "message" {
+		if !ok || len(parts) != 3 || asString(parts[0]) != "message" || asString(parts[1]) != t.channel {
+			continue
+		}
+		payload, ok := parts[2].(string)
+		if !ok {
+			log.Printf("decode remote event: payload is %T", parts[2])
 			continue
 		}
 		var envelope remoteEnvelope
-		if err := json.Unmarshal([]byte(asString(parts[2])), &envelope); err != nil {
+		if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
 			log.Printf("decode remote event: %v", err)
 			continue
 		}
-		if envelope.OriginNodeID == t.nodeID {
+		if envelope.OriginNodeID == "" || envelope.OriginNodeID == t.nodeID {
 			continue
 		}
 		event := sseeventbus.Event{ClientIDs: envelope.Event.ClientIDs, ExcludeClientIDs: envelope.Event.ExcludeClientIDs, Name: envelope.Event.Name, Retry: time.Duration(envelope.Event.Retry), ID: envelope.Event.ID, Comment: envelope.Event.Comment}
@@ -170,6 +221,13 @@ func writeCommand(writer io.Writer, parts ...string) error {
 }
 
 func readRESP(reader *bufio.Reader) (any, error) {
+	return readRESPDepth(reader, 0)
+}
+
+func readRESPDepth(reader *bufio.Reader, depth int) (any, error) {
+	if depth > maxRESPDepth {
+		return nil, errors.New("RESP nesting is too deep")
+	}
 	prefix, err := reader.ReadByte()
 	if err != nil {
 		return nil, err
@@ -179,8 +237,8 @@ func readRESP(reader *bufio.Reader) (any, error) {
 		if err != nil {
 			return "", err
 		}
-		if len(value) < 2 {
-			return "", errors.New("invalid RESP line")
+		if !strings.HasSuffix(value, "\r\n") {
+			return "", errors.New("RESP line does not end in CRLF")
 		}
 		return value[:len(value)-2], nil
 	}
@@ -208,12 +266,18 @@ func readRESP(reader *bufio.Reader) (any, error) {
 		if parseErr != nil {
 			return nil, parseErr
 		}
-		if length < 0 {
+		if length == -1 {
 			return nil, nil
+		}
+		if length < -1 || length > maxRESPBulkSize {
+			return nil, fmt.Errorf("invalid RESP bulk length %d", length)
 		}
 		buffer := make([]byte, length+2)
 		if _, readErr = io.ReadFull(reader, buffer); readErr != nil {
 			return nil, readErr
+		}
+		if buffer[length] != '\r' || buffer[length+1] != '\n' {
+			return nil, errors.New("RESP bulk string does not end in CRLF")
 		}
 		return string(buffer[:length]), nil
 	case '*':
@@ -225,9 +289,15 @@ func readRESP(reader *bufio.Reader) (any, error) {
 		if parseErr != nil {
 			return nil, parseErr
 		}
+		if count == -1 {
+			return nil, nil
+		}
+		if count < -1 || count > maxRESPArraySize {
+			return nil, fmt.Errorf("invalid RESP array length %d", count)
+		}
 		values := make([]any, count)
 		for i := range values {
-			values[i], readErr = readRESP(reader)
+			values[i], readErr = readRESPDepth(reader, depth+1)
 			if readErr != nil {
 				return nil, readErr
 			}
